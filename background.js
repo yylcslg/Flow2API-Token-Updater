@@ -8,7 +8,7 @@ const MAX_REFRESH_INTERVAL = 1440;
 const REQUEST_TIMEOUT_MS = 30000;
 const RETRY_DELAYS_MS = [1500, 4000];
 
-const FLOW_URL = 'https://flow.google.com/projects';
+const FLOW_URL = 'https://flow.google.com';
 const MODERN_FLOW_COOKIE_NAMES = new Set(['OSID', '__Secure-OSID']);
 const GOOGLE_ACCOUNT_COOKIE_NAMES = new Set([
     'SID',
@@ -123,6 +123,112 @@ chrome.runtime.onStartup.addListener(() => {
         Logger.error('扩展启动失败', { error: error.message });
     });
 });
+
+// 捕获 batchexecute 请求实际携带的Cookie头（部分Google账号Cookie对cookies API不可见，但请求会正常携带）
+const BATCHEXECUTE_PATH = 'AiSandboxAngularFrontend/data/batchexecute';
+let latestBatchexecuteCapture = { tabId: -1, timestamp: 0, cookieHeader: '' };
+
+chrome.webRequest.onSendHeaders.addListener(
+    (details) => {
+        if (!details.url.includes(BATCHEXECUTE_PATH)) {
+            return;
+        }
+        const cookieHeader = details.requestHeaders?.find(
+            header => header.name.toLowerCase() === 'cookie'
+        );
+        if (!cookieHeader || !cookieHeader.value) {
+            return;
+        }
+        latestBatchexecuteCapture = {
+            tabId: details.tabId,
+            timestamp: Date.now(),
+            cookieHeader: cookieHeader.value
+        };
+    },
+    { urls: ['*://*.google.com/*'] },
+    ['requestHeaders', 'extraHeaders']
+);
+
+// 等待指定标签页在本轮同步期间发起 batchexecute 请求并捕获其Cookie头
+function waitForBatchexecuteCookies(tabId, sinceTimestamp, timeoutMs = 8000) {
+    const startedAt = Date.now();
+    return new Promise(resolve => {
+        const check = () => {
+            if (
+                latestBatchexecuteCapture.tabId === tabId
+                && latestBatchexecuteCapture.timestamp >= sinceTimestamp
+                && latestBatchexecuteCapture.cookieHeader
+            ) {
+                resolve(latestBatchexecuteCapture.cookieHeader);
+                return;
+            }
+            if (Date.now() - startedAt >= timeoutMs) {
+                resolve('');
+                return;
+            }
+            setTimeout(check, 250);
+        };
+        check();
+    });
+}
+
+// 解析请求中的 Cookie 头为 name/value 列表
+function parseRequestCookieHeader(headerValue) {
+    return String(headerValue || '').split(';')
+        .map(part => {
+            const separatorIndex = part.indexOf('=');
+            if (separatorIndex <= 0) {
+                return null;
+            }
+            const name = part.slice(0, separatorIndex).trim();
+            const value = part.slice(separatorIndex + 1).trim();
+            return name && value ? { name, value } : null;
+        })
+        .filter(Boolean);
+}
+
+// 根据请求Cookie名称推断其所属域名（Cookie头本身不携带域名属性）
+function inferRequestCookieDomain(name) {
+    if (name === 'OSID' || name === '__Secure-OSID') {
+        return { domain: 'flow.google.com', hostOnly: true };
+    }
+    if (name === '_ga' || /^_ga_[A-Z0-9]+$/i.test(name)) {
+        return { domain: '.flow.google.com', hostOnly: false };
+    }
+    return { domain: '.google.com', hostOnly: false };
+}
+
+// 将请求头中的Cookie合并进cookies API结果：API可见的保留完整属性，缺失的用请求头补齐
+function mergeRequestHeaderCookies(apiCookies, cookieHeader) {
+    const requestCookies = parseRequestCookieHeader(cookieHeader);
+    if (requestCookies.length === 0) {
+        return apiCookies;
+    }
+    const existingKeys = new Set(
+        apiCookies.map(cookie => `${cookie.name}@${normalizeCookieDomain(cookie.domain)}`)
+    );
+    const merged = [...apiCookies];
+    for (const { name, value } of requestCookies) {
+        const { domain, hostOnly } = inferRequestCookieDomain(name);
+        const key = `${name}@${normalizeCookieDomain(domain)}`;
+        if (existingKeys.has(key)) {
+            continue;
+        }
+        existingKeys.add(key);
+        merged.push({
+            name,
+            value,
+            domain,
+            path: '/',
+            secure: true,
+            httpOnly: false,
+            hostOnly,
+            session: false,
+            sameSite: 'unspecified'
+        });
+    }
+    return merged;
+}
 
 // 监听来自popup的消息
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -427,10 +533,17 @@ function serializeCookieStorage(cookies) {
     return JSON.stringify(payload);
 }
 
-async function collectRelevantCookies() {
+async function collectRelevantCookies(requestCookieHeader = '') {
     const cookies = await chrome.cookies.getAll({ url: FLOW_URL });
-    await Logger.info(`从Flow页面请求范围找到 ${cookies.length} 个Cookie`);
-    return deduplicateCookies(cookies);
+    const apiCookies = deduplicateCookies(cookies);
+    const requestCookies = parseRequestCookieHeader(requestCookieHeader);
+    const mergedCookies = mergeRequestHeaderCookies(apiCookies, requestCookieHeader);
+    const supplementedCount = mergedCookies.length - apiCookies.length;
+    await Logger.info(
+        `cookies API找到 ${apiCookies.length} 个Cookie，batchexecute请求头含 ${requestCookies.length} 个Cookie，补齐 ${supplementedCount} 个，合并后共 ${mergedCookies.length} 个唯一Cookie`,
+        { supplementedNames: mergedCookies.slice(apiCookies.length).map(cookie => cookie.name) }
+    );
+    return mergedCookies;
 }
 
 async function closeTemporaryTab(tab) {
@@ -616,6 +729,7 @@ async function extractAndSendToken() {
 
         // 1. 打开新版Flow页面（在后台），让浏览器刷新当前登录态
         await Logger.info('正在打开Google Flow页面...');
+        const syncStartedAt = Date.now();
         tab = await chrome.tabs.create({
             url: FLOW_URL,
             active: false
@@ -628,6 +742,16 @@ async function extractAndSendToken() {
         await Logger.info('页面加载完成，等待JavaScript执行...');
 
         await sleep(5000);
+
+        // 等待页面发起 batchexecute 请求，捕获请求实际携带的Cookie
+        const requestCookieHeader = await waitForBatchexecuteCookies(tab.id, syncStartedAt);
+        if (requestCookieHeader) {
+            await Logger.success('已捕获batchexecute请求Cookie头', {
+                cookieCount: parseRequestCookieHeader(requestCookieHeader).length
+            });
+        } else {
+            await Logger.error('未捕获到batchexecute请求Cookie头，将仅使用cookies API结果');
+        }
 
         const loadedTab = await chrome.tabs.get(tab.id);
         let loadedHost = '';
@@ -647,8 +771,8 @@ async function extractAndSendToken() {
 
         await Logger.info('开始提取Cookies...');
 
-        // 2. 提取新版Flow会话与Google账号Cookie
-        const uniqueCookies = await collectRelevantCookies();
+        // 2. 提取新版Flow会话与Google账号Cookie（合并batchexecute请求头中实际携带的Cookie）
+        const uniqueCookies = await collectRelevantCookies(requestCookieHeader);
 
         await Logger.info(`总共找到 ${uniqueCookies.length} 个唯一Cookie`);
 
